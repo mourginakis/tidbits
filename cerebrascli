@@ -4,9 +4,132 @@ set -euo pipefail
 # ============================================================
 # Claude Code + Cerebras via LiteLLM (local gateway)
 # ============================================================
+#
+# WHAT
+# ----
+# Runs Claude Code against Cerebras-hosted models instead of Anthropic.
+# Spins up a LiteLLM Docker container as a local gateway that translates
+# between the Anthropic Messages API (which Claude Code speaks) and the
+# OpenAI Chat Completions API (which Cerebras speaks), then launches
+# Claude Code pointed at the gateway.
+#
+# HOW IT WORKS
+# ------------
+#   Claude Code  -->  Python proxy (:4001)  -->  LiteLLM Docker (:4000)  -->  Cerebras API
+#
+#   1. A LiteLLM Docker container starts on LITELLM_PORT (default 4000).
+#      It receives Anthropic-format requests at /v1/messages, translates
+#      them to OpenAI format, and forwards to the Cerebras API.
+#
+#   2. A thin Python reverse proxy starts on PROXY_PORT (LITELLM_PORT+1).
+#      It intercepts requests, strips Anthropic-only parameters that
+#      Cerebras doesn't support (see "KNOWN BUGS" below), then forwards
+#      the cleaned request to LiteLLM.  Raw sockets are used so SSE
+#      streaming passes through with zero buffering.
+#
+#   3. Claude Code is launched with env vars pointing it at the proxy.
+#
+# ENVIRONMENT VARIABLES SET FOR CLAUDE CODE
+# ------------------------------------------
+#   ANTHROPIC_BASE_URL          - Points to the local proxy, not Anthropic.
+#   ANTHROPIC_AUTH_TOKEN        - Per-run random token (sk-...) used as a
+#                                 Bearer token.  Claude Code's Anthropic SDK
+#                                 sends this as "Authorization: Bearer ...",
+#                                 which LiteLLM accepts for proxy auth.
+#                                 (ANTHROPIC_API_KEY would send x-api-key
+#                                 instead, which LiteLLM wouldn't recognize.)
+#   ANTHROPIC_MODEL             - The model name Claude Code puts in the
+#                                 request body; must match a model_name in
+#                                 the LiteLLM config.
+#   ANTHROPIC_DEFAULT_*_MODEL   - Override the opus/sonnet/haiku aliases so
+#                                 /model switching, subagents, and background
+#                                 tasks all route to the Cerebras model.
+#   CLAUDE_CODE_SUBAGENT_MODEL  - Model for Agent tool subprocesses.
+#
+# COMPATIBILITY: CLAUDE CODE → LiteLLM → CEREBRAS
+# -------------------------------------------------
+# Claude Code always speaks the Anthropic Messages API.  LiteLLM translates
+# this to the OpenAI Chat Completions API that Cerebras speaks.  Below is
+# what happens to each parameter Claude Code sends:
+#
+#   PRESERVED (translated to OpenAI equivalents by LiteLLM)
+#     messages          → messages (content blocks → OpenAI format)
+#     system            → system message (role: "system")
+#     tools             → tools (Anthropic tool schema → OpenAI function tools)
+#     tool_choice       → tool_choice ("any" → "required", "auto" → "auto")
+#     tool results      → tool messages (tool_use_id preserved)
+#     max_tokens        → max_tokens
+#     temperature       → temperature
+#     top_p             → top_p
+#     stop_sequences    → stop (Cerebras supports up to 4)
+#     stream            → stream (SSE format differences handled by LiteLLM)
+#     metadata.user_id  → user
+#
+#   DROPPED (no Cerebras/OpenAI equivalent; harmless to lose)
+#     top_k             - OpenAI API has no top_k; Cerebras doesn't either
+#     cache_control     - Anthropic prompt caching; OpenAI/Cerebras auto-cache
+#     metadata.*        - Only user_id survives as "user"; rest is dropped
+#     anthropic-beta    - Header for Anthropic beta features; not applicable
+#     thinking          - Anthropic extended thinking param; dropped by LiteLLM
+#                         for non-o-series models.  However, gpt-oss-120b
+#                         generates chain-of-thought reasoning by default, and
+#                         we set reasoning_effort: "high" below to maximize it.
+#
+#   STRIPPED BY OUR PROXY (would cause 422 errors)
+#     context_management - Anthropic server-side context compaction; see bug #2
+#
+#   CEREBRAS-SPECIFIC FEATURES ENABLED VIA CONFIG
+#     reasoning_effort  - Set to "high" for gpt-oss-120b (supports low/medium/
+#                         high).  This is the Cerebras equivalent of Anthropic's
+#                         extended thinking — it maximizes chain-of-thought
+#                         reasoning depth, which is critical for agentic coding.
+#     parallel_tool_calls - Supported by Cerebras; LiteLLM passes through.
+#     response_format   - Cerebras supports json_schema, json_object, text;
+#                         LiteLLM translates if Claude Code ever sends it.
+#
+# KNOWN BUGS WORKED AROUND
+# -------------------------
+#   1. macOS mktemp + suffix:  BSD mktemp doesn't replace X placeholders
+#      when the template has a suffix (e.g. XXXXXX.yaml).  It creates a
+#      file literally named "XXXXXX.yaml", which works once then fails
+#      with "File exists" on the next run.
+#      Fix: template ends with X's, no suffix.
+#
+#   2. LiteLLM drop_params vs context_management:  Claude Code sends
+#      "context_management" in POST /v1/messages (an Anthropic-specific
+#      param for server-side context compaction).  Cerebras returns 422.
+#      LiteLLM's drop_params:true is supposed to strip unsupported params,
+#      but its Anthropic adapter (marked "experimental" in their source)
+#      has a bug: the retry-after-drop path returns None instead of the
+#      actual response, crashing with "'NoneType' has no attribute
+#      'choices'" (LiteLLM 1.81.12, Feb 2026).
+#      Fix: the Python proxy strips context_management from the JSON body
+#      BEFORE it reaches LiteLLM, sidestepping the bug entirely.
+#      The proxy uses raw sockets (not http.server) so that SSE streaming
+#      events are forwarded byte-for-byte without buffering.
+#
+#   3. exec prevents cleanup:  The original script used "exec env ...
+#      claude" which replaces the shell process.  This means the EXIT
+#      trap never fires, leaving the Docker container and Python proxy
+#      running after Claude Code exits.
+#      Fix: run claude as a foreground child process (no exec) so the
+#      shell survives and the trap fires on exit.
+#
+# REQUIREMENTS
+# ------------
+#   - docker (daemon running), python3 (any 3.x), curl, bash
+#   - The LiteLLM Docker image (pulled automatically on first run)
+#   - A valid Cerebras API key
+#
+# USAGE
+# -----
+#   ./cerebrascli                   # interactive session
+#   ./cerebrascli -p "hello"        # one-shot non-interactive
+#   PORT=5000 ./cerebrascli         # use a custom port pair (5000/5001)
+#
 
 # ---- EDIT ----
-CEREBRAS_API_KEY="csk-00000"
+CEREBRAS_API_KEY="csk-0000"
 
 # Pick ONE (Cerebras model IDs)
 MODEL_ID="gpt-oss-120b"
@@ -14,7 +137,8 @@ MODEL_ID="gpt-oss-120b"
 # MODEL_ID="qwen-3-235b-a22b-instruct-2507"
 # MODEL_ID="zai-glm-4.7"
 
-PORT="${PORT:-4000}"
+LITELLM_PORT="${PORT:-4000}"
+PROXY_PORT="$((LITELLM_PORT + 1))"
 IMAGE="docker.litellm.ai/berriai/litellm:main-stable"
 
 # Optional: stop Claude Code auto-memory from being included in prompts
@@ -35,6 +159,10 @@ case "$MODEL_ID" in
   ;;
 esac
 
+command -v docker >/dev/null 2>&1 || { echo "Error: docker is required but not found." >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "Error: python3 is required but not found." >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "Error: curl is required but not found." >&2; exit 1; }
+
 # Per-run gateway auth token (proxy auth); must start with sk-
 if command -v openssl >/dev/null 2>&1; then
   LITELLM_MASTER_KEY="sk-$(openssl rand -hex 16)"
@@ -42,12 +170,16 @@ else
   LITELLM_MASTER_KEY="sk-$(date +%s)$RANDOM$RANDOM"
 fi
 
-TMP_CFG="$(mktemp /tmp/litellm_cerebras_XXXXXX.yaml)"
+# No .yaml suffix -- see "macOS mktemp + suffix" in header comment.
+TMP_CFG="$(mktemp /tmp/litellm_cerebras_XXXXXX)"
+TMP_PROXY="$(mktemp /tmp/litellm_proxy_XXXXXX)"
 CONTAINER="litellm-cerebras-$RANDOM$RANDOM"
+PROXY_PID=""
 
 cleanup() {
+  [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  rm -f "$TMP_CFG" >/dev/null 2>&1 || true
+  rm -f "$TMP_CFG" "$TMP_PROXY" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -61,14 +193,18 @@ model_list:
       model: cerebras/gpt-oss-120b
       api_base: https://api.cerebras.ai/v1
       api_key: os.environ/CEREBRAS_API_KEY
+      drop_params: true
       extra_headers:
         X-Cerebras-3rd-Party-Integration: litellm
+      extra_body:
+        reasoning_effort: "high"
 
   - model_name: llama3.1-8b
     litellm_params:
       model: cerebras/llama3.1-8b
       api_base: https://api.cerebras.ai/v1
       api_key: os.environ/CEREBRAS_API_KEY
+      drop_params: true
       extra_headers:
         X-Cerebras-3rd-Party-Integration: litellm
 
@@ -77,6 +213,7 @@ model_list:
       model: cerebras/qwen-3-235b-a22b-instruct-2507
       api_base: https://api.cerebras.ai/v1
       api_key: os.environ/CEREBRAS_API_KEY
+      drop_params: true
       extra_headers:
         X-Cerebras-3rd-Party-Integration: litellm
 
@@ -85,38 +222,143 @@ model_list:
       model: cerebras/zai-glm-4.7
       api_base: https://api.cerebras.ai/v1
       api_key: os.environ/CEREBRAS_API_KEY
+      drop_params: true
       extra_headers:
         X-Cerebras-3rd-Party-Integration: litellm
 
 litellm_settings:
+  drop_params: true
   master_key: os.environ/LITELLM_MASTER_KEY
 YAML
 
+# ---- Thin reverse proxy (see "LiteLLM drop_params" in header comment) ----
+# Strips context_management (and any future STRIP_KEYS) from POST /v1/messages
+# bodies, then forwards byte-for-byte to LiteLLM via raw sockets so SSE
+# streaming events are never buffered.  Uses only Python stdlib.
+cat > "$TMP_PROXY" <<'PYEOF'
+import json, re, socket, sys, threading
+
+LITELLM_HOST = "127.0.0.1"
+LITELLM_PORT = int(sys.argv[1])
+LISTEN_PORT  = int(sys.argv[2])
+STRIP_KEYS   = {"context_management"}
+
+def read_http_request(sock):
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        data = sock.recv(4096)
+        if not data:
+            return None, None
+        buf += data
+    header_end = buf.index(b"\r\n\r\n") + 4
+    headers_raw = buf[:header_end]
+    body_so_far = buf[header_end:]
+    m = re.search(rb"(?i)content-length:\s*(\d+)", headers_raw)
+    content_length = int(m.group(1)) if m else 0
+    while len(body_so_far) < content_length:
+        data = sock.recv(min(4096, content_length - len(body_so_far)))
+        if not data:
+            break
+        body_so_far += data
+    return headers_raw, body_so_far
+
+def modify_request(headers_raw, body):
+    first_line = headers_raw.split(b"\r\n", 1)[0].decode()
+    if not first_line.startswith("POST") or "/v1/messages" not in first_line:
+        return headers_raw + body
+    try:
+        data = json.loads(body)
+        changed = False
+        for k in STRIP_KEYS:
+            if k in data:
+                del data[k]
+                changed = True
+        if not changed:
+            return headers_raw + body
+        new_body = json.dumps(data).encode()
+        new_headers = re.sub(
+            rb"(?i)content-length:\s*\d+",
+            b"Content-Length: " + str(len(new_body)).encode(),
+            headers_raw,
+        )
+        return new_headers + new_body
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return headers_raw + body
+
+def handle_client(client_sock):
+    upstream = None
+    try:
+        headers_raw, body = read_http_request(client_sock)
+        if headers_raw is None:
+            return
+        modified = modify_request(headers_raw, body)
+        upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        upstream.connect((LITELLM_HOST, LITELLM_PORT))
+        upstream.sendall(modified)
+        while True:
+            data = upstream.recv(8192)
+            if not data:
+                break
+            client_sock.sendall(data)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    finally:
+        for s in (upstream, client_sock):
+            if s:
+                try: s.close()
+                except OSError: pass
+
+def main():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try: srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError): pass
+    srv.bind(("127.0.0.1", LISTEN_PORT))
+    srv.listen(32)
+    while True:
+        client_sock, _ = srv.accept()
+        threading.Thread(target=handle_client, args=(client_sock,), daemon=True).start()
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
 docker run -d --name "$CONTAINER" \
-  -p "127.0.0.1:${PORT}:4000" \
+  -p "127.0.0.1:${LITELLM_PORT}:4000" \
   -v "${TMP_CFG}:/app/config.yaml:ro" \
   -e CEREBRAS_API_KEY="$CEREBRAS_API_KEY" \
   -e LITELLM_MASTER_KEY="$LITELLM_MASTER_KEY" \
   "$IMAGE" --config /app/config.yaml >/dev/null
 
-# Wait for readiness (curl will error if missing)
+# Start the param-stripping reverse proxy
+python3 "$TMP_PROXY" "$LITELLM_PORT" "$PROXY_PORT" &
+PROXY_PID=$!
+
+# Wait for LiteLLM readiness
 for _ in {1..100}; do
-  curl -fsS "http://127.0.0.1:${PORT}/health/readiness" >/dev/null 2>&1 && break
+  curl -fsS "http://127.0.0.1:${LITELLM_PORT}/health/readiness" >/dev/null 2>&1 && break
   sleep 0.1
 done
-curl -fsS "http://127.0.0.1:${PORT}/health/readiness" >/dev/null 2>&1 || {
-  echo "Error: LiteLLM proxy not ready on http://127.0.0.1:${PORT}" >&2
+curl -fsS "http://127.0.0.1:${LITELLM_PORT}/health/readiness" >/dev/null 2>&1 || {
+  echo "Error: LiteLLM proxy not ready on http://127.0.0.1:${LITELLM_PORT}" >&2
   docker logs "$CONTAINER" >&2 || true
   exit 1
 }
 
-exec env \
-  ANTHROPIC_BASE_URL="http://127.0.0.1:${PORT}" \
-  ANTHROPIC_AUTH_TOKEN="$LITELLM_MASTER_KEY" \
-  ANTHROPIC_MODEL="$MODEL_ID" \
-  ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL_ID" \
-  ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL_ID" \
-  ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL_ID" \
-  CLAUDE_CODE_SUBAGENT_MODEL="$MODEL_ID" \
-  NO_PROXY="127.0.0.1,localhost" \
+# Wait for the Python proxy to be ready
+for _ in {1..20}; do
+  curl -fsS "http://127.0.0.1:${PROXY_PORT}/health/readiness" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+
+# No "exec" -- we need the shell to survive so the EXIT trap fires and
+# cleans up the Docker container + Python proxy (see header comment).
+ANTHROPIC_BASE_URL="http://127.0.0.1:${PROXY_PORT}" \
+ANTHROPIC_AUTH_TOKEN="$LITELLM_MASTER_KEY" \
+ANTHROPIC_MODEL="$MODEL_ID" \
+ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL_ID" \
+ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL_ID" \
+ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL_ID" \
+CLAUDE_CODE_SUBAGENT_MODEL="$MODEL_ID" \
+NO_PROXY="127.0.0.1,localhost" \
   claude "$@"
