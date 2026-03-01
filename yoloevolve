@@ -1,0 +1,52 @@
+#!/bin/bash
+# yoloevolve - the sandboxed evolve loop
+#
+# --dangerously-skip-permissions auto-approves every tool call, including bash.
+# A stray "rm -rf ~" doesn't need sudo — you own your home directory. This
+# script runs Claude inside a disposable Docker container so the worst it can
+# do is trash /workspace, which is a mounted copy of your project. Worst case:
+# git checkout to recover.
+#
+# Your project is mounted at /workspace, so CLAUDE.md is picked up automatically.
+#
+# SETUP:
+#   1. Docker running
+#   2. bash chromex.sh                                     (Chrome on port 9224)
+#
+# USAGE:
+#   ./yoloclaude                     # interactive
+#   ./yoloclaude "fill out the app"  # with a prompt
+
+set -euo pipefail
+
+# Pull the full OAuth credentials from macOS Keychain where Claude Code stores
+# them. The keychain entry is a JSON blob under "Claude Code-credentials" —
+# we pass it into the container to write as ~/.claude/.credentials.json.
+CLAUDE_CREDENTIALS=$(security find-generic-password -s "Claude Code-credentials" -w)
+export CLAUDE_CREDENTIALS
+
+
+# Inline image build — no Dockerfile to maintain
+# claude refuses --dangerously-skip-permissions as root, so we
+# have to create a user
+DOCKERFILE='
+FROM node:22
+RUN apt-get update && apt-get install -y jq && rm -rf /var/lib/apt/lists/*
+RUN npm install -g @anthropic-ai/claude-code
+# Claude refuses --dangerously-skip-permissions as root
+RUN useradd -m claude
+USER claude
+WORKDIR /workspace
+'
+
+# Inline image build — no Dockerfile to maintain
+# --quiet suppresses build log spam
+docker build --quiet -t claude-sandbox - <<<"$DOCKERFILE"
+
+
+
+
+
+
+
+
