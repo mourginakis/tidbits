@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# Claude Code + Cerebras via LiteLLM (local gateway)
+# ============================================================
+
+# ---- EDIT ----
+CEREBRAS_API_KEY="csk-00000"
+
+# Pick ONE (Cerebras model IDs)
+MODEL_ID="gpt-oss-120b"
+# MODEL_ID="llama3.1-8b"
+# MODEL_ID="qwen-3-235b-a22b-instruct-2507"
+# MODEL_ID="zai-glm-4.7"
+
+PORT="${PORT:-4000}"
+IMAGE="docker.litellm.ai/berriai/litellm:main-stable"
+
+# Optional: stop Claude Code auto-memory from being included in prompts
+# export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+
+# ---- fast-fail checks we actually care about ----
+if [[ "$CEREBRAS_API_KEY" == "PASTE_CEREBRAS_API_KEY_HERE" || -z "$CEREBRAS_API_KEY" ]]; then
+  echo "Error: paste your Cerebras API key into CEREBRAS_API_KEY in this script." >&2
+  exit 1
+fi
+
+case "$MODEL_ID" in
+  gpt-oss-120b|llama3.1-8b|qwen-3-235b-a22b-instruct-2507|zai-glm-4.7) ;;
+  *)
+    echo "Error: MODEL_ID '$MODEL_ID' is not in the allowlist." >&2
+    echo "Allowed: gpt-oss-120b | llama3.1-8b | qwen-3-235b-a22b-instruct-2507 | zai-glm-4.7" >&2
+    exit 1
+  ;;
+esac
+
+# Per-run gateway auth token (proxy auth); must start with sk-
+if command -v openssl >/dev/null 2>&1; then
+  LITELLM_MASTER_KEY="sk-$(openssl rand -hex 16)"
+else
+  LITELLM_MASTER_KEY="sk-$(date +%s)$RANDOM$RANDOM"
+fi
+
+TMP_CFG="$(mktemp /tmp/litellm_cerebras_XXXXXX.yaml)"
+CONTAINER="litellm-cerebras-$RANDOM$RANDOM"
+
+cleanup() {
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  rm -f "$TMP_CFG" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+# Avoid Claude Code ignoring the gateway token if ANTHROPIC_API_KEY was set in your shell
+unset ANTHROPIC_API_KEY
+
+cat > "$TMP_CFG" <<'YAML'
+model_list:
+  - model_name: gpt-oss-120b
+    litellm_params:
+      model: cerebras/gpt-oss-120b
+      api_base: https://api.cerebras.ai/v1
+      api_key: os.environ/CEREBRAS_API_KEY
+      extra_headers:
+        X-Cerebras-3rd-Party-Integration: litellm
+
+  - model_name: llama3.1-8b
+    litellm_params:
+      model: cerebras/llama3.1-8b
+      api_base: https://api.cerebras.ai/v1
+      api_key: os.environ/CEREBRAS_API_KEY
+      extra_headers:
+        X-Cerebras-3rd-Party-Integration: litellm
+
+  - model_name: qwen-3-235b-a22b-instruct-2507
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      api_base: https://api.cerebras.ai/v1
+      api_key: os.environ/CEREBRAS_API_KEY
+      extra_headers:
+        X-Cerebras-3rd-Party-Integration: litellm
+
+  - model_name: zai-glm-4.7
+    litellm_params:
+      model: cerebras/zai-glm-4.7
+      api_base: https://api.cerebras.ai/v1
+      api_key: os.environ/CEREBRAS_API_KEY
+      extra_headers:
+        X-Cerebras-3rd-Party-Integration: litellm
+
+litellm_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+YAML
+
+docker run -d --name "$CONTAINER" \
+  -p "127.0.0.1:${PORT}:4000" \
+  -v "${TMP_CFG}:/app/config.yaml:ro" \
+  -e CEREBRAS_API_KEY="$CEREBRAS_API_KEY" \
+  -e LITELLM_MASTER_KEY="$LITELLM_MASTER_KEY" \
+  "$IMAGE" --config /app/config.yaml >/dev/null
+
+# Wait for readiness (curl will error if missing)
+for _ in {1..100}; do
+  curl -fsS "http://127.0.0.1:${PORT}/health/readiness" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -fsS "http://127.0.0.1:${PORT}/health/readiness" >/dev/null 2>&1 || {
+  echo "Error: LiteLLM proxy not ready on http://127.0.0.1:${PORT}" >&2
+  docker logs "$CONTAINER" >&2 || true
+  exit 1
+}
+
+exec env \
+  ANTHROPIC_BASE_URL="http://127.0.0.1:${PORT}" \
+  ANTHROPIC_AUTH_TOKEN="$LITELLM_MASTER_KEY" \
+  ANTHROPIC_MODEL="$MODEL_ID" \
+  ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL_ID" \
+  ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL_ID" \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL_ID" \
+  CLAUDE_CODE_SUBAGENT_MODEL="$MODEL_ID" \
+  NO_PROXY="127.0.0.1,localhost" \
+  claude "$@"
