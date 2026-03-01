@@ -14,8 +14,7 @@
 #   2. bash chromex.sh                                     (Chrome on port 9224)
 #
 # USAGE:
-#   ./yoloevolve                     # interactive
-#   ./yoloevolve "fill out the app"  # with a prompt
+#   ./yoloevolve
 
 set -euo pipefail
 
@@ -93,12 +92,8 @@ echo '{"skipDangerousModePermissionPrompt":true,"effortLevel":"high"}' > ~/.clau
 CHROME_IP=$(getent hosts host.docker.internal | awk '{print $1}')
 claude mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --browserUrl "http://${CHROME_IP}:9224"
 
-# Launch Claude
-if [ $# -gt 0 ]; then
-  exec claude --dangerously-skip-permissions -p "$*"
-else
-  exec claude --dangerously-skip-permissions
-fi
+# Launch the evolve loop
+exec ./evolve
 ENTRY
 chmod +x "$ENTRYPOINT"
 
@@ -120,7 +115,7 @@ docker run -it --rm --init \
   -e COLORTERM="${COLORTERM:-truecolor}" \
   --add-host=host.docker.internal:host-gateway \
   claude-sandbox \
-  bash /entrypoint.sh "$@"
+  bash /entrypoint.sh
 
 
 
