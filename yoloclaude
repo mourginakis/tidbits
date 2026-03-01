@@ -91,7 +91,7 @@ chmod +x "$ENTRYPOINT"
 
 # Container is removed on exit (--rm). Nothing persists.
 # Backgrounded so `wait` is interruptible by signals; EXIT trap docker-kills it.
-docker run --rm --init --name "$CNAME" \
+docker run --rm --init -it --name "$CNAME" \
   -v "$(pwd)":/workspace \
   -v "$ENTRYPOINT":/entrypoint.sh:ro \
   -e CLAUDE_CREDENTIALS \
