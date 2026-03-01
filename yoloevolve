@@ -14,10 +14,14 @@
 #   2. bash chromex.sh                                     (Chrome on port 9224)
 #
 # USAGE:
-#   ./yoloclaude                     # interactive
-#   ./yoloclaude "fill out the app"  # with a prompt
+#   ./yoloevolve                     # interactive
+#   ./yoloevolve "fill out the app"  # with a prompt
 
 set -euo pipefail
+
+
+
+# == CREDENTIALS ==============================================================
 
 # Pull the full OAuth credentials from macOS Keychain where Claude Code stores
 # them. The keychain entry is a JSON blob under "Claude Code-credentials" —
@@ -26,10 +30,14 @@ CLAUDE_CREDENTIALS=$(security find-generic-password -s "Claude Code-credentials"
 export CLAUDE_CREDENTIALS
 
 
+
+# == DOCKERFILE + BUILD =======================================================
+
 # Inline image build — no Dockerfile to maintain
 # claude refuses --dangerously-skip-permissions as root, so we create a user
-# requirements.txt is piped in via --build-arg since heredoc builds have no
+# requirements.txt is piped in via --build-arg since stdin builds have no
 # COPY context. Docker layer cache rebuilds the pip layer only when reqs change.
+# TODO: do we need to do requirements at build time?
 DOCKERFILE='
 FROM node:22
 RUN apt-get update && apt-get install -y jq python3 python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
@@ -47,7 +55,6 @@ RUN if [ -n "$REQUIREMENTS" ]; then \
 WORKDIR /workspace
 '
 
-# Inline image build — no Dockerfile to maintain
 # --quiet suppresses build log spam
 docker build --quiet \
   --build-arg REQUIREMENTS="$(cat requirements.txt 2>/dev/null)" \
@@ -55,7 +62,65 @@ docker build --quiet \
 
 
 
+# == ENTRYPOINT SCRIPT ========================================================
 
+# Write a temporary entrypoint script that sets up config files and launches
+# Claude. This avoids nested heredoc/quoting hell in bash -c.
+ENTRYPOINT=$(mktemp)
+trap "rm -f '$ENTRYPOINT'" EXIT
+
+cat > "$ENTRYPOINT" <<'ENTRY'
+#!/bin/bash
+set -euo pipefail
+
+# Write config files so Claude launches with zero interactive prompts.
+#   ~/.claude.json          — skips onboarding and workspace trust dialog
+#   ~/.claude/settings.json — skips bypass-permissions warning, sets effort level
+#   ~/.claude/.credentials.json — OAuth tokens from macOS Keychain
+mkdir -p ~/.claude
+
+echo "$CLAUDE_CREDENTIALS" > ~/.claude/.credentials.json
+chmod 600 ~/.claude/.credentials.json
+
+echo '{"hasCompletedOnboarding":true,"hasTrustDialogHooksAccepted":true,"effortCalloutDismissed":true,"lastOnboardingVersion":"2.1.62","numStartups":1,"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}' > ~/.claude.json
+
+echo '{"skipDangerousModePermissionPrompt":true,"effortLevel":"high"}' > ~/.claude/settings.json
+
+# Chrome runs on the host Mac (port 9224 via chromex.sh). We resolve
+# host.docker.internal to its IP because Chrome's DevTools server rejects
+# HTTP requests with non-IP, non-localhost Host headers (security check
+# since Chrome 66). Using the raw IP makes the Host header pass validation.
+CHROME_IP=$(getent hosts host.docker.internal | awk '{print $1}')
+claude mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --browserUrl "http://${CHROME_IP}:9224"
+
+# Launch Claude
+if [ $# -gt 0 ]; then
+  exec claude --dangerously-skip-permissions -p "$*"
+else
+  exec claude --dangerously-skip-permissions
+fi
+ENTRY
+chmod +x "$ENTRYPOINT"
+
+
+
+# == RUN ======================================================================
+
+#   -i    keep stdin open (interactive)
+#   -t    allocate a TTY (colors, line editing)
+#   -v    bind-mount a host path into the container
+#   -e    pass an env var through
+#   --rm    auto-remove the container on exit
+#   --init  run tini as PID 1 so signals (Ctrl+C) and zombie reaping work
+docker run -it --rm --init \
+  -v "$(pwd)":/workspace \
+  -v "$ENTRYPOINT":/entrypoint.sh:ro \
+  -e CLAUDE_CREDENTIALS \
+  -e TERM="${TERM:-xterm-256color}" \
+  -e COLORTERM="${COLORTERM:-truecolor}" \
+  --add-host=host.docker.internal:host-gateway \
+  claude-sandbox \
+  bash /entrypoint.sh "$@"
 
 
 
