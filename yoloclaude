@@ -15,7 +15,22 @@
 
 set -euo pipefail
 
-
+# Pipe stream-json through this to get clean, readable text.
+humanize_stream() {
+  jq --unbuffered -rj '
+    select(.type == "assistant") | .message.content[]? |
+    if .type == "text" then .text
+    elif .type == "tool_use" then
+      "\n--- \(.name)" +
+      (if .input.command then ": " + .input.command
+       elif .input.file_path then ": " + .input.file_path
+       elif .input.pattern then ": " + .input.pattern
+       else "" end) +
+      " ---\n"
+    elif .type == "thinking" then "\n--- Thinking ---\n\(.thinking)\n"
+    else empty end
+  '
+}
 
 # == CONTAINER ================================================================
 # When docker run re-invokes this script inside the container, YOLO_CONTAINER
@@ -40,19 +55,7 @@ if [ -n "${YOLO_CONTAINER:-}" ]; then
 
   if [ $# -gt 0 ]; then
     claude --dangerously-skip-permissions -p "$*" --output-format stream-json \
-      | jq --unbuffered -rj '
-          select(.type == "assistant") | .message.content[]? |
-          if .type == "text" then .text
-          elif .type == "tool_use" then
-            "\n--- \(.name)" +
-            (if .input.command then ": " + .input.command
-             elif .input.file_path then ": " + .input.file_path
-             elif .input.pattern then ": " + .input.pattern
-             else "" end) +
-            " ---\n"
-          elif .type == "thinking" then "\n--- Thinking ---\n\(.thinking)\n"
-          else empty end
-        '
+      | humanize_stream
   else
     exec claude --dangerously-skip-permissions
   fi
