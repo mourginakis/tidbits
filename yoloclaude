@@ -58,11 +58,14 @@ fi
 
 
 
-# == HOST =====================================================================
+# == SANDBOX_BUILD ============================================================
+# Builds the Docker image and launches the container on the host.
 
+# Pull Claude's auth token from the macOS keychain.
 CLAUDE_CREDENTIALS=$(security find-generic-password -s "Claude Code-credentials" -w)
 export CLAUDE_CREDENTIALS
 
+# Inline Dockerfile: Node 22, Claude Code, Python venv, optional pip requirements.
 DOCKERFILE='
 FROM node:22
 RUN apt-get update && apt-get install -y jq python3 python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
@@ -80,13 +83,14 @@ RUN if [ -n "$REQUIREMENTS" ]; then \
 WORKDIR /workspace
 '
 
+# Build the image, injecting requirements.txt if present.
 docker build --quiet \
   --build-arg REQUIREMENTS="$(cat requirements.txt 2>/dev/null)" \
   -t claude-sandbox - <<<"$DOCKERFILE"
 
-# Foreground docker run — the standard pattern for interactive containers.
-# -it: both required so the PTY translates Ctrl+C into SIGINT for the whole
-#   process group, not just PID 1. --init: tini forwards SIGTERM on docker stop.
+# Run the container, re-invoking this script as the entrypoint.
+# -it: PTY so Ctrl+C sends SIGINT to the whole process group.
+# --init: tini forwards SIGTERM on docker stop.
 docker run -it --rm --init \
   -v "$(pwd)":/workspace \
   -v "$(realpath "$0")":/entrypoint.sh:ro \
