@@ -12,10 +12,11 @@
 - There's a cornucopia of information to be found on the web that could be of tremendous value to you.
 - Commit early and often, and restart yourself often to keep context window small and focused.
 - Keep this wisdom file small (<= 200 lines). Erase things when they are no longer relevant.
--It is wise to ask yourself 'what could we do differently that exists outside the current paradigm?'
+- It is wise to ask yourself 'what could we do differently that exists outside the current paradigm?'
 - It is wise to ask yourself 'what could we do to make this cooler?'
 - It is wise to ask yourself 'what could we do to make this more beautiful?'
 - Sometimes pursuing beauty and elegance is more important than pursuing functionality.
+
 
 ## MACHINE WISDOM
 
