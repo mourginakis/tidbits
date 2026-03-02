@@ -36,7 +36,8 @@ humanize_stream() {
 # When docker run re-invokes this script inside the container, SANDBOXED is set.
 
 if [ -n "${SANDBOXED:-}" ]; then
-  # Keychain auth. Onboarding skipped. Dangerous mode. Ready.
+  # ~/.claude/.credentials.json = auth token (from host keychain via env var).
+  # ~/.claude.json = skip onboarding dialogs. ~/.claude/settings.json = yolo mode.
   mkdir -p ~/.claude
   echo "$CLAUDE_CREDENTIALS" > ~/.claude/.credentials.json
   chmod 600 ~/.claude/.credentials.json
