@@ -13,10 +13,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 - `walk.py` is a clojure inspired tree traversal library.
 
 
-## Singularity
+## Evolve (singularity)
 
 - claude's `--dangerously-skip-permissions` should probably be run in docker.
 - `yoloclaude` is a wrapper that runs claude in a docker container.
-- `singularity` is a recursive self improvement loop. 🫣
-- `golem.py` is accessability for browser automation.
+- `evolve` is a recursive self improvement loop. 🫣
+- `golem.py` is accessibility for browser automation.
 - `chromex` is a script that starts chrome and exposes CDP.
