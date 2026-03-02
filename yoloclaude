@@ -1,13 +1,9 @@
 #!/bin/bash
-# yoloclaude — Sandboxed Claude Code with Chrome DevTools.
+# yoloclaude — Sandboxed Claude Code with Chrome DevTools
 #
-# --dangerously-skip-permissions auto-approves every tool call, including bash.
-# A stray "rm -rf ~" doesn't need sudo — you own your home directory. This
-# script runs Claude inside a disposable Docker container so the worst it can
-# do is trash /workspace, which is a mounted copy of your project. Worst case:
-# git checkout to recover.
-#
-# Your project is mounted at /workspace, so CLAUDE.md is picked up automatically.
+# This script serves double duty: on the host it builds and launches a Docker
+# container; inside the container (detected via YOLO_CONTAINER) it configures
+# and runs Claude. One file, no temp files.
 #
 # SETUP:
 #   1. Docker running
@@ -15,87 +11,92 @@
 #
 # USAGE:
 #   ./yoloclaude                     # interactive
-#   ./yoloclaude "fill out the app"  # with a prompt
+#   ./yoloclaude "fill out the app"  # single prompt
 
 set -euo pipefail
 
-# Pull the full OAuth credentials from macOS Keychain where Claude Code stores
-# them. The keychain entry is a JSON blob under "Claude Code-credentials" —
-# we pass it into the container to write as ~/.claude/.credentials.json.
+
+
+# == CONTAINER ================================================================
+# When docker run re-invokes this script inside the container, YOLO_CONTAINER
+# is set. Everything above the `fi` runs only inside the container.
+
+if [ -n "${YOLO_CONTAINER:-}" ]; then
+  mkdir -p ~/.claude
+
+  echo "$CLAUDE_CREDENTIALS" > ~/.claude/.credentials.json
+  chmod 600 ~/.claude/.credentials.json
+
+  echo '{"hasCompletedOnboarding":true,"hasTrustDialogHooksAccepted":true,"effortCalloutDismissed":true,"lastOnboardingVersion":"2.1.62","numStartups":1,"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}' > ~/.claude.json
+
+  echo '{"skipDangerousModePermissionPrompt":true,"effortLevel":"high"}' > ~/.claude/settings.json
+
+  # Chrome runs on the host Mac (port 9224 via chromex.sh). We resolve
+  # host.docker.internal to its IP because Chrome's DevTools server rejects
+  # HTTP requests with non-IP, non-localhost Host headers (security check
+  # since Chrome 66). Using the raw IP makes the Host header pass validation.
+  CHROME_IP=$(getent hosts host.docker.internal | awk '{print $1}')
+  claude mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --browserUrl "http://${CHROME_IP}:9224"
+
+  if [ $# -gt 0 ]; then
+    claude --dangerously-skip-permissions -p "$*" --output-format stream-json \
+      | jq --unbuffered -rj '
+          select(.type == "assistant") | .message.content[]? |
+          if .type == "text" then .text
+          elif .type == "tool_use" then
+            "\n--- \(.name)" +
+            (if .input.command then ": " + .input.command
+             elif .input.file_path then ": " + .input.file_path
+             elif .input.pattern then ": " + .input.pattern
+             else "" end) +
+            " ---\n"
+          elif .type == "thinking" then "\n--- Thinking ---\n\(.thinking)\n"
+          else empty end
+        '
+  else
+    exec claude --dangerously-skip-permissions
+  fi
+  exit 0
+fi
+
+
+
+# == HOST =====================================================================
+
 CLAUDE_CREDENTIALS=$(security find-generic-password -s "Claude Code-credentials" -w)
 export CLAUDE_CREDENTIALS
 
-# Inline image build — no Dockerfile to maintain
-# --quiet suppresses build log spam
-docker build --quiet -t claude-sandbox - <<'DOCKERFILE'
+DOCKERFILE='
 FROM node:22
-RUN apt-get update && apt-get install -y jq && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y jq python3 python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @anthropic-ai/claude-code
-# Claude refuses --dangerously-skip-permissions as root
 RUN useradd -m claude
 USER claude
+RUN python3 -m venv /home/claude/venv
+ENV PATH="/home/claude/venv/bin:$PATH"
+ARG REQUIREMENTS
+RUN if [ -n "$REQUIREMENTS" ]; then \
+      printf "%s\n" "$REQUIREMENTS" > /tmp/requirements.txt \
+      && pip install -r /tmp/requirements.txt \
+      && rm /tmp/requirements.txt; \
+    fi
 WORKDIR /workspace
-DOCKERFILE
+'
 
-# Write a temporary entrypoint script that sets up config files and launches
-# Claude. This avoids nested heredoc/quoting hell in bash -c.
-ENTRYPOINT=$(mktemp)
-CNAME="yolo-$$"
-trap "docker kill $CNAME 2>/dev/null; rm -f $ENTRYPOINT" EXIT
+docker build --quiet \
+  --build-arg REQUIREMENTS="$(cat requirements.txt 2>/dev/null)" \
+  -t claude-sandbox - <<<"$DOCKERFILE"
 
-cat > "$ENTRYPOINT" <<'ENTRY'
-#!/bin/bash
-set -euo pipefail
-
-# Write config files so Claude launches with zero interactive prompts.
-#   ~/.claude.json          — skips onboarding and workspace trust dialog
-#   ~/.claude/settings.json — skips bypass-permissions warning, sets effort level
-#   ~/.claude/.credentials.json — OAuth tokens from macOS Keychain
-mkdir -p ~/.claude
-
-echo "$CLAUDE_CREDENTIALS" > ~/.claude/.credentials.json
-chmod 600 ~/.claude/.credentials.json
-
-echo '{"hasCompletedOnboarding":true,"hasTrustDialogHooksAccepted":true,"effortCalloutDismissed":true,"lastOnboardingVersion":"2.1.62","numStartups":1,"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}' > ~/.claude.json
-
-echo '{"skipDangerousModePermissionPrompt":true,"effortLevel":"high"}' > ~/.claude/settings.json
-
-# Chrome runs on the host Mac (port 9224 via chromex.sh). We resolve
-# host.docker.internal to its IP because Chrome's DevTools server rejects
-# HTTP requests with non-IP, non-localhost Host headers (security check
-# since Chrome 66). Using the raw IP makes the Host header pass validation.
-CHROME_IP=$(getent hosts host.docker.internal | awk '{print $1}')
-claude mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --browserUrl "http://${CHROME_IP}:9224"
-
-# Launch Claude
-if [ $# -gt 0 ]; then
-  exec claude --dangerously-skip-permissions -p "$*" --verbose --output-format stream-json \
-    | jq --unbuffered -rj '
-        select(.type == "assistant") | .message.content[]? |
-        if .type == "text" then .text
-        elif .type == "tool_use" then
-          "\n--- \(.name)" +
-          (if .input.command then ": " + .input.command
-           elif .input.file_path then ": " + .input.file_path
-           elif .input.pattern then ": " + .input.pattern
-           else "" end) +
-          " ---\n"
-        elif .type == "thinking" then "\n--- Thinking ---\n\(.thinking)\n"
-        else empty end
-      '
-else
-  exec claude --dangerously-skip-permissions
-fi
-ENTRY
-chmod +x "$ENTRYPOINT"
-
-# Container is removed on exit (--rm). Nothing persists.
-# Backgrounded so `wait` is interruptible by signals; EXIT trap docker-kills it.
-docker run --rm --init -it --name "$CNAME" \
+# Foreground docker run — the standard pattern for interactive containers.
+# -it: both required so the PTY translates Ctrl+C into SIGINT for the whole
+#   process group, not just PID 1. --init: tini forwards SIGTERM on docker stop.
+docker run -it --rm --init \
   -v "$(pwd)":/workspace \
-  -v "$ENTRYPOINT":/entrypoint.sh:ro \
+  -v "$(realpath "$0")":/entrypoint.sh:ro \
   -e CLAUDE_CREDENTIALS \
+  -e YOLO_CONTAINER=1 \
+  -e TERM="${TERM:-xterm-256color}" \
+  -e COLORTERM="${COLORTERM:-truecolor}" \
   --add-host=host.docker.internal:host-gateway \
   claude-sandbox \
-  bash /entrypoint.sh "$@" &
-wait $!
+  bash /entrypoint.sh "$@"
