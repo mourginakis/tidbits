@@ -18,16 +18,13 @@ set -euo pipefail
 # Pipe stream-json through this to get clean, readable text.
 humanize_stream() {
   jq --unbuffered -rj '
+    def tool_detail: (.input | .command // .file_path // .pattern | strings | ": \(.)") // "";
+    def render_tool:     "\n--- \(.name)\(tool_detail) ---\n";
+    def render_thinking: "\n--- Thinking ---\n\(.thinking)\n";
     select(.type == "assistant") | .message.content[]? |
-    if .type == "text" then .text
-    elif .type == "tool_use" then
-      "\n--- \(.name)" +
-      (if .input.command then ": " + .input.command
-       elif .input.file_path then ": " + .input.file_path
-       elif .input.pattern then ": " + .input.pattern
-       else "" end) +
-      " ---\n"
-    elif .type == "thinking" then "\n--- Thinking ---\n\(.thinking)\n"
+    if   .type == "text"     then .text
+    elif .type == "tool_use" then render_tool
+    elif .type == "thinking" then render_thinking
     else empty end
   '
 }
