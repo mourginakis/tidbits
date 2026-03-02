@@ -2,7 +2,7 @@
 # yoloclaude — Sandboxed Claude Code with Chrome DevTools
 #
 # This script serves double duty: on the host it builds and launches a Docker
-# container; inside the container (detected via YOLO_CONTAINER) it configures
+# container; inside the container (detected via SANDBOXED) it configures
 # and runs Claude. One file, no temp files.
 #
 # SETUP:
@@ -32,24 +32,19 @@ humanize_stream() {
   '
 }
 
-# == CONTAINER ================================================================
-# When docker run re-invokes this script inside the container, YOLO_CONTAINER
-# is set. Everything above the `fi` runs only inside the container.
+# == SANDBOX ===================================================================
+# When docker run re-invokes this script inside the container, SANDBOXED is set.
 
-if [ -n "${YOLO_CONTAINER:-}" ]; then
+if [ -n "${SANDBOXED:-}" ]; then
+  # Keychain auth. Onboarding skipped. Dangerous mode. Ready.
   mkdir -p ~/.claude
-
   echo "$CLAUDE_CREDENTIALS" > ~/.claude/.credentials.json
   chmod 600 ~/.claude/.credentials.json
-
   echo '{"hasCompletedOnboarding":true,"hasTrustDialogHooksAccepted":true,"effortCalloutDismissed":true,"lastOnboardingVersion":"2.1.62","numStartups":1,"projects":{"/workspace":{"hasTrustDialogAccepted":true}}}' > ~/.claude.json
-
   echo '{"skipDangerousModePermissionPrompt":true,"effortLevel":"high"}' > ~/.claude/settings.json
 
-  # Chrome runs on the host Mac (port 9224 via chromex.sh). We resolve
-  # host.docker.internal to its IP because Chrome's DevTools server rejects
-  # HTTP requests with non-IP, non-localhost Host headers (security check
-  # since Chrome 66). Using the raw IP makes the Host header pass validation.
+  # Resolve host.docker.internal to an IP — Chrome's DevTools rejects non-IP
+  # Host headers (since Chrome 66), so we need the raw IP for validation.
   CHROME_IP=$(getent hosts host.docker.internal | awk '{print $1}')
   claude mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --browserUrl "http://${CHROME_IP}:9224"
 
@@ -95,7 +90,7 @@ docker run -it --rm --init \
   -v "$(pwd)":/workspace \
   -v "$(realpath "$0")":/entrypoint.sh:ro \
   -e CLAUDE_CREDENTIALS \
-  -e YOLO_CONTAINER=1 \
+  -e SANDBOXED=1 \
   -e TERM="${TERM:-xterm-256color}" \
   -e COLORTERM="${COLORTERM:-truecolor}" \
   --add-host=host.docker.internal:host-gateway \
