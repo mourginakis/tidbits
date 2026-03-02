@@ -53,12 +53,10 @@ if [ -n "${YOLO_CONTAINER:-}" ]; then
   CHROME_IP=$(getent hosts host.docker.internal | awk '{print $1}')
   claude mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --browserUrl "http://${CHROME_IP}:9224"
 
-  if [ $# -gt 0 ]; then
-    claude --dangerously-skip-permissions -p "$*" --output-format stream-json \
-      | humanize_stream
-  else
-    exec claude --dangerously-skip-permissions
-  fi
+  case $# in
+    0) claude --dangerously-skip-permissions ;;
+    *) claude --dangerously-skip-permissions -p "$*" --output-format stream-json | humanize_stream ;;
+  esac
   exit 0
 fi
 
