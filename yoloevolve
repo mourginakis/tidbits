@@ -47,7 +47,7 @@ RUN python3 -m venv /home/claude/venv
 ENV PATH="/home/claude/venv/bin:$PATH"
 ARG REQUIREMENTS
 RUN if [ -n "$REQUIREMENTS" ]; then \
-      printf '%s\n' "$REQUIREMENTS" > /tmp/requirements.txt \
+      printf "%s\n" "$REQUIREMENTS" > /tmp/requirements.txt \
       && pip install -r /tmp/requirements.txt \
       && rm /tmp/requirements.txt; \
     fi
