@@ -5,7 +5,7 @@ set -e
 # https://api-docs.deepseek.com/guides/anthropic_api
 
 DEEPSEEK_API_KEY="sk-00000"
-MODEL="deepseek-chat"   # or deepseek-reasoner
+MODEL="deepseek-chat"
 MODEL="deepseek-reasoner"
 
 exec env \
